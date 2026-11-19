@@ -896,6 +896,40 @@ pub mod nested {
     }
 
     #[test]
+    fn items_in_fn_bodies() {
+        let (mut db, _) = RootDatabase::with_many_files(
+            r#"
+//- /lib.rs crate:main
+macro_rules! define_struct {
+    () => { struct FromMacroInFn; };
+}
+macro_rules! assert {
+    ($e:expr) => {};
+}
+fn plain() {
+    assert!(true);
+}
+fn with_item() {
+    struct StructInFn;
+}
+fn with_macro() {
+    define_struct!();
+}
+"#,
+        );
+
+        let mut local_roots = FxHashSet::default();
+        local_roots.insert(WORKSPACE);
+        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+
+        for name in ["StructInFn", "FromMacroInFn"] {
+            let symbols = world_symbols(&db, Query::new(name.to_owned()));
+            let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&name), "Expected {name} in {names:?}");
+        }
+    }
+
+    #[test]
     fn test_path_search_module() {
         let (mut db, _) = RootDatabase::with_many_files(
             r#"

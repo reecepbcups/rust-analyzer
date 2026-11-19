@@ -413,6 +413,9 @@ impl<'a> SymbolCollector<'a> {
             return;
         }
         let body_id = body_id.into();
+        if !body_may_have_block_items(self.db, body_id) {
+            return;
+        }
         let body = Body::of(self.db, body_id);
 
         // Descend into the blocks and enqueue collection of all modules within.
@@ -583,3 +586,83 @@ impl<'a> SymbolCollector<'a> {
         });
     }
 }
+
+/// Lowering every body just to find items nested in blocks was most of cache priming's cost,
+/// so only lower bodies that syntactically contain an item, or a macro call that might expand
+/// to one. The listed macros are common expression/statement macros that never produce items.
+fn body_may_have_block_items(db: &dyn HirDatabase, body_id: DefWithBodyId) -> bool {
+    let body = match body_id {
+        DefWithBodyId::FunctionId(id) => {
+            id.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+        }
+        DefWithBodyId::StaticId(id) => {
+            id.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+        }
+        DefWithBodyId::ConstId(id) => {
+            id.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
+        }
+        DefWithBodyId::VariantId(_) => return true,
+    };
+    let Some(body) = body else { return false };
+    body.descendants().any(|node| match syntax::ast::MacroCall::cast(node.clone()) {
+        Some(call) => !call
+            .path()
+            .and_then(|path| path.segment())
+            .and_then(|segment| segment.name_ref())
+            .is_some_and(|name| ITEMLESS_MACROS.contains(&name.text())),
+        None => syntax::ast::Item::can_cast(node.kind()),
+    })
+}
+
+const ITEMLESS_MACROS: &[&str] = &[
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "assert_matches",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "matches",
+    "panic",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "dbg",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "vec",
+    "concat",
+    "stringify",
+    "include_str",
+    "include_bytes",
+    "env",
+    "option_env",
+    "line",
+    "column",
+    "file",
+    "module_path",
+    "cfg",
+    "compile_error",
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+    "span",
+    "trace_span",
+    "debug_span",
+    "info_span",
+    "warn_span",
+    "error_span",
+    "anyhow",
+    "bail",
+    "ensure",
+    "format_err",
+];
