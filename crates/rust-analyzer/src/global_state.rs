@@ -181,6 +181,12 @@ pub(crate) struct GlobalState {
     pub(crate) fetch_build_data_queue: OpQueue<(), FetchBuildDataResponse>,
     pub(crate) fetch_proc_macros_queue: OpQueue<(ChangeWithProcMacros, Vec<ProcMacroPaths>), bool>,
     pub(crate) prime_caches_queue: OpQueue,
+    /// `crates_done` at the last GC during priming. Only grows across cancelled restarts.
+    pub(crate) prime_caches_gc_mark: usize,
+    /// Set when our own mid-priming GC cancelled priming, so the restart reuses the progress bar.
+    pub(crate) prime_caches_gc_restarting: bool,
+    /// A mid-priming GC is due, waiting for priming to be the only running task.
+    pub(crate) prime_caches_gc_pending: bool,
 
     /// A deferred task queue.
     ///
@@ -323,6 +329,9 @@ impl GlobalState {
             fetch_proc_macros_queue: OpQueue::default(),
 
             prime_caches_queue: OpQueue::default(),
+            prime_caches_gc_mark: 0,
+            prime_caches_gc_restarting: false,
+            prime_caches_gc_pending: false,
 
             deferred_task_queue,
             incomplete_crate_graph: false,

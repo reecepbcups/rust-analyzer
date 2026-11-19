@@ -130,6 +130,11 @@ pub(crate) enum DiscoverProjectParam {
     Path(AbsPathBuf),
 }
 
+/// Fewest primed crates between GCs during priming. Big workspaces space them out further
+/// so there are at most `PRIME_CACHES_MAX_GCS`, since every GC restarts priming.
+const PRIME_CACHES_GC_MIN_CRATES: usize = 32;
+const PRIME_CACHES_MAX_GCS: usize = 3;
+
 #[derive(Debug)]
 pub(crate) enum PrimeCachesProgress {
     Begin,
@@ -357,25 +362,31 @@ impl GlobalState {
                 for progress in prime_caches_progress {
                     match progress {
                         PrimeCachesProgress::Begin => {
-                            self.report_progress(
-                                title,
-                                Progress::Begin,
-                                None,
-                                Some(0.0),
-                                cancel_token(),
-                            );
+                            if self.prime_caches_gc_restarting {
+                                self.prime_caches_gc_restarting = false;
+                            } else {
+                                self.report_progress(
+                                    title,
+                                    Progress::Begin,
+                                    None,
+                                    Some(0.0),
+                                    cancel_token(),
+                                );
+                            }
                         }
                         PrimeCachesProgress::Report(report) => {
+                            // Restarts after a GC fly through cached crates, don't show them going backwards.
+                            let crates_done = report.crates_done.max(self.prime_caches_gc_mark);
                             let message = match &*report.crates_currently_indexing {
                                 [crate_name] => Some(format!(
                                     "{}/{} ({})",
-                                    report.crates_done,
+                                    crates_done,
                                     report.crates_total,
                                     crate_name.as_str(),
                                 )),
                                 [crate_name, rest @ ..] => Some(format!(
                                     "{}/{} ({} + {} more)",
-                                    report.crates_done,
+                                    crates_done,
                                     report.crates_total,
                                     crate_name.as_str(),
                                     rest.len()
@@ -387,17 +398,35 @@ impl GlobalState {
                             // serializes notifications on the mainthread at the moment which slows us down
                             last_report = Some((
                                 message,
-                                Progress::fraction(report.crates_done, report.crates_total),
+                                Progress::fraction(crates_done, report.crates_total),
                                 report.work_type,
                             ));
+
+                            // LRU eviction only runs on a new revision, so without this every
+                            // parse tree from priming stays alive until the end, doubling peak memory
+                            // and fragmenting the heap. This cancels priming, which then restarts.
+                            let gc_every = PRIME_CACHES_GC_MIN_CRATES
+                                .max(report.crates_total / PRIME_CACHES_MAX_GCS);
+                            if report.crates_done >= self.prime_caches_gc_mark + gc_every {
+                                self.prime_caches_gc_mark = report.crates_done;
+                                self.prime_caches_gc_pending = true;
+                            }
+                            self.maybe_gc_during_priming();
                         }
                         PrimeCachesProgress::End { cancelled } => {
-                            self.analysis_host.trigger_garbage_collection();
+                            // Our mid-priming GC already collected; keep the progress bar up for the restart.
+                            let gc_restart = cancelled && self.prime_caches_gc_restarting;
+                            if !gc_restart {
+                                self.prime_caches_gc_restarting = false;
+                                self.prime_caches_gc_pending = false;
+                                self.analysis_host.trigger_garbage_collection();
+                            }
                             self.prime_caches_queue.op_completed(());
                             if cancelled {
                                 self.prime_caches_queue
                                     .request_op("restart after cancellation".to_owned(), ());
                             } else {
+                                self.prime_caches_gc_mark = 0;
                                 if self.config.check_on_save(None)
                                     && self.config.flycheck_workspace(None)
                                     && !self.fetch_build_data_queue.op_requested()
@@ -420,13 +449,15 @@ impl GlobalState {
                                     cancel_token(),
                                 );
                             }
-                            self.report_progress(
-                                title,
-                                Progress::End,
-                                None,
-                                Some(1.0),
-                                cancel_token(),
-                            );
+                            if !gc_restart {
+                                self.report_progress(
+                                    title,
+                                    Progress::End,
+                                    None,
+                                    Some(1.0),
+                                    cancel_token(),
+                                );
+                            }
                         }
                     };
                 }
@@ -576,6 +607,8 @@ impl GlobalState {
                 self.update_tests();
             }
 
+            self.maybe_gc_during_priming();
+
             let current_revision = self.analysis_host.raw_database().nonce_and_revision().1;
             // no work is currently being done, now we can block a bit and clean up our garbage
             if self.task_pool.handle.is_empty()
@@ -642,6 +675,21 @@ impl GlobalState {
                 (cancellation took {cancellation_time:?}) \
                 (garbage collection took {gc_elapsed:?})"
             ));
+        }
+    }
+
+    /// Runs a pending mid-priming GC once priming is the only running task, so user requests
+    /// never get cancelled by it.
+    fn maybe_gc_during_priming(&mut self) {
+        if self.prime_caches_gc_pending
+            && self.task_pool.handle.len() == 1
+            && self.fmt_pool.handle.is_empty()
+        {
+            self.prime_caches_gc_pending = false;
+            self.prime_caches_gc_restarting = true;
+            // Only bump the revision so LRU'd parse trees get evicted. A full GC would also
+            // collect interned types, and priming would then redo all type-dependent work.
+            self.analysis_host.trigger_cancellation();
         }
     }
 
