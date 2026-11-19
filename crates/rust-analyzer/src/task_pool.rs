@@ -43,6 +43,10 @@ impl<T> TaskPool<T> {
     pub(crate) fn is_empty(&self) -> bool {
         self.pool.is_empty()
     }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pool.len()
+    }
 }
 
 /// `DeferredTaskQueue` holds deferred tasks.
